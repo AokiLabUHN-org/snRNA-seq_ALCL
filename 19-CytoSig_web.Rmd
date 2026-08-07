@@ -1,0 +1,123 @@
+CytoSig
+
+1. Preparing CytoSig input for RUN module:
+- The expression values, from either RNASeq or MicroArray, should be transformed by log2(x+1). 
+- x could be FPKM, RPKM, or TPM for RNASeq. 
+- For single-cell RNASeq data, used log2(TPM/10 + 1). 
+- Recommeded to input differential profiles between the two conditions. 
+- If data is from a sample collection without pairs, do mean-centralize the value of each gene across all samples.
+
+2. Preparing CytoSig RUN module:
+- Log in to https://cytosig.ccr.cancer.gov/
+- Choose RUN module
+- Upload the input file (CytoSig_input_Endothelial_meancentered.txt) and click "Run"
+
+
+# CytoSig on endothelial subcluster
+```{r}
+# Load Seurat object: Stromal_endothelial 
+load("/cluster/projects/aokigroup/t138390uhn/scRNAseq_ALCL_FFPE/data/Seurat_objects/subclustering_2603/Stromal_endothelial_subclustering_res0.1.Rdata")
+
+# Check column names of metadata
+colnames(stromal_endothelial@meta.data)
+
+# Remove stromal clusters, keep only endothelial and LEC
+endothelial <- subset(stromal_endothelial, subset = stromal_endothelial_celltype == "endothelial" | stromal_endothelial_celltype == "LEC")
+
+table(endothelial$stromal_endothelial_celltype) 
+# endothelial         LEC
+#        1562         878 
+
+# Output dir
+out_dir_cytosig <- "/cluster/home/t138390uhn/scRNAseq_ALCL_FFPE/figures/CytoSig/"
+dir.create(out_dir_cytosig, recursive = TRUE, showWarnings = FALSE)
+
+
+# ============================================================================ #
+# Normalization for CytoSig
+# Formula: log2(TPM/10 + 1)
+# ============================================================================ #
+
+normalize_cytosig <- function(counts_mat) {
+  # Step 1: TPM normalization
+  # TPM = (counts / gene_length) — but for scRNA-seq without gene lengths
+  # TPM is approximated as CPM (counts per million) since we don't have gene lengths
+  tpm <- sweep(counts_mat, 2, colSums(counts_mat), "/") * 1e6
+
+  # Step 2: log2(TPM/10 + 1) (CytoSig formula)
+  log2_tpm <- log2(tpm / 10 + 1)
+
+  return(log2_tpm)
+}
+
+# Aggregate per patient
+pb_pos <- AggregateExpression(
+  endothelial,
+  group.by = "stromal_endothelial_celltype",
+  assays   = "RNA",
+  slot     = "counts"
+)$RNA
+pb_pos <- as.matrix(pb_pos)
+
+# Normalize: log2(TPM/10 + 1) — CytoSig formula
+tpm_pos          <- sweep(pb_pos, 2, colSums(pb_pos), "/") * 1e6
+cytosig_pos      <- log2(tpm_pos / 10 + 1)
+
+nrow(cytosig_pos)  
+ncol(cytosig_pos) 
+#[1] 18518
+# [1] 2
+
+# check:
+cat("Any NA:", anyNA(cytosig_pos), "\n")
+cat("Any Inf:", any(is.infinite(cytosig_pos)), "\n")
+cat("Expression range:", round(range(cytosig_pos), 3), "\n")
+## Expected: Min = 0, Max ~ 10-15
+# Any NA: FALSE 
+# Any Inf: FALSE 
+# Expression range: 0 9.338 
+
+
+# Save
+cytosig_pos_df <- as.data.frame(cytosig_pos) %>%
+  tibble::rownames_to_column(var = "Gene")
+
+write.table(
+  cytosig_pos_df,
+  file      = file.path(out_dir_cytosig, "CytoSig_input_Endothelial_pseudobulk.txt"),
+  sep       = "\t",
+  quote     = FALSE,
+  row.names = FALSE
+)
+
+
+# ============================================================================ #
+# Mean Centralization
+# Required because endothelial subcluster has no paired condition
+# ============================================================================ #
+
+row_means      <- rowMeans(cytosig_pos)
+cytosig_pos_mc <- cytosig_pos - row_means
+
+round(range(cytosig_pos_mc), 3)
+# [1] -3.891  3.891
+
+# Should be centered around 0
+# output:
+# Mean-centralized range: -3.891  3.891
+# Min: -3.891  <- genes expressed BELOW average across patients
+# Max:  3.891  <- genes expressed ABOVE average across patients
+# meaning Centered around 0
+
+cytosig_pos_mc_df <- as.data.frame(cytosig_pos_mc) %>%
+  tibble::rownames_to_column(var = "Gene")
+
+write.table(
+  cytosig_pos_mc_df,
+  file      = file.path(out_dir_cytosig, "CytoSig_input_Endothelial_meancentered.txt"),
+  sep       = "\t",
+  quote     = FALSE,
+  row.names = FALSE
+)
+
+```
