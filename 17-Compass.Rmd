@@ -1,0 +1,360 @@
+---
+title: "Metabolic analysis using Compass"
+author: "Putri Ramadani"
+date: "2026-08-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Compass on dendritic cells cluster
+
+## 1. Prepare input (HPC)
+- the original compass use Scanpy and other Python-based toolsfor pseudobulking, but here I use AggregateExpression in Seurat to do pseudobulking. 
+- The key is to make sure the output files are in the format that Compass expects (expression.mtx, genes.tsv, sample_names.tsv, and matedata).
+```{r}
+# load Seurat object 
+load("/cluster/projects/aokigroup/t138390uhn/scRNAseq_ALCL_FFPE/data/Seurat_objects/subclustering_2603/Myeloid_subclustering_res0.2_annotated.Rdata")
+
+# check column names of metadata
+colnames(myeloid@meta.data)
+
+table(myeloid$myeloid_celltype, myeloid$StudyID)
+
+DCs <- subset(myeloid, subset = myeloid_celltype == "cDC1" | myeloid_celltype == "cDC2" | myeloid_celltype == "pDC")
+
+ncol(DCs) # [1] 3274
+nrow(DCs) # [1] 18518
+
+# dir
+out_dir <- "/cluster/home/t138390uhn/scRNAseq_ALCL_FFPE/data/processed/compass_DCs"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+DefaultAssay(DCs) <- "RNA"
+
+# use a "--" separator 
+DCs$pbulk_group <- paste(DCs$myeloid_celltype, DCs$StudyID, sep = "--")
+
+# --- 1) Pseudobulk ---
+pbulk <- AggregateExpression(
+  DCs, 
+  assays   = "RNA",
+  slot     = "counts",
+  group.by = "pbulk_group",
+  return.seurat = FALSE
+)
+
+pbulk_counts <- pbulk$RNA   # genes x pseudobulks
+nrow(pbulk_counts)
+ncol(pbulk_counts)
+# Pseudobulk matrix: 18518 genes x 120 pseudobulks
+
+# --- 2) CPM normalize ---
+lib_sizes <- colSums(pbulk_counts)
+cpm <- t(t(pbulk_counts) / lib_sizes) * 1e6
+
+# --- 3) Write Compass inputs ---
+writeMM(as(cpm, "sparseMatrix"), file = file.path(out_dir, "expression.mtx"))
+## inside expression.mtx:
+## Rows = genes 
+## Columns = pseudobulks 
+## Values = CPM expression (counts per million, library-size normalized)
+
+write.table(rownames(cpm),
+            file = file.path(out_dir, "genes.tsv"),
+            sep = "\t", quote = FALSE,
+            row.names = FALSE, col.names = FALSE)
+
+write.table(colnames(cpm),
+            file = file.path(out_dir, "sample_names.tsv"),
+            sep = "\t", quote = FALSE,
+            row.names = FALSE, col.names = FALSE)
+
+# note:
+# expression.mtx = the numbers
+# genes.tsv = the gene names (matches the rows in order)
+# sample_names.tsv = the pseudobulk names (matches the columns in order)
+
+
+# --- 4) Metadata ---
+pbulk_meta <- data.frame(
+  pbulk_id = colnames(cpm),
+  stringsAsFactors = FALSE
+)
+pbulk_meta$myeloid_celltype <- sub("--.+$", "", pbulk_meta$pbulk_id)
+pbulk_meta$StudyID          <- sub("^.+--", "", pbulk_meta$pbulk_id)
+
+group_sizes <- table(DCs$pbulk_group)
+pbulk_meta$n_cells <- as.integer(group_sizes[pbulk_meta$pbulk_id])
+
+patient_info <- unique(
+  DCs@meta.data[, c("StudyID", "Disease", "Relapse", "Subtype", "Category1", "Category2", "SPN_status", "CIRBP_status", "LGALS3_status")]
+)
+pbulk_meta <- dplyr::left_join(pbulk_meta, patient_info, by = "StudyID")
+
+write.table(pbulk_meta,
+            file = file.path(out_dir, "pbulk_metadata.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# check output:
+print(list.files(out_dir))
+print(range(colSums(cpm)))  
+print(head(pbulk_meta))
+# [1] "expression.mtx"     "genes.tsv"          "pbulk_metadata.tsv"
+# [4] "sample_names.tsv"  
+# [1] 1e+06 1e+06
+
+       pbulk_id myeloid_celltype StudyID n_cells  Disease    Relapse Subtype
+1 cDC1--ALCL001             cDC1 ALCL001      15 ALK+ALCL No Relapse  Type I
+2 cDC1--ALCL002             cDC1 ALCL002       3 ALK+ALCL No Relapse  Type I
+3 cDC1--ALCL003             cDC1 ALCL003      17 ALK+ALCL    Relapse  Type I
+4 cDC1--ALCL004             cDC1 ALCL004       1 ALK+ALCL No Relapse  Type I
+5 cDC1--ALCL005             cDC1 ALCL005       2 ALK+ALCL No Relapse  Type I
+6 cDC1--ALCL006             cDC1 ALCL006      24 ALK+ALCL No Relapse  Type I
+  Category1      Category2 SPN_status CIRBP_status LGALS3_status
+1 Pediatric pediatric_ALCL   negative     positive      positive
+2 Pediatric pediatric_ALCL   negative     negative      positive
+3 Pediatric pediatric_ALCL   negative     positive      negative
+4 Pediatric pediatric_ALCL   negative     negative      positive
+5 Pediatric pediatric_ALCL   negative     negative      positive
+6 Pediatric pediatric_ALCL   negative     positive      positive
+
+```
+
+
+## 2. Perform Compass
+- download new gurobi license
+-  perform Compass on Nibi (Canada Alliance) because Compass and Gurobi need internet
+
+### Move outputs to Nibi Alliance
+```{bash}
+scp -r /Users/putriramadani/Documents/GitHub/scRNAseq_ALCL_FFPE/data/processed/compass_DCs/ taoki@nibi.alliancecan.ca:~/
+```
+
+### Nibi on login node 
+note: make sure to request access to nibi through Tomo's account, and prepare gurobi license in the same dir as compass_DCs.sh
+compass_DCs.sh
+```{bash}
+#!/bin/bash
+#SBATCH --account=def-taoki_cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
+#SBATCH --time=5:00:00
+#SBATCH --job-name=compass_DCs
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
+
+unset PYTHONPATH
+source ~/miniconda3/bin/activate compass
+
+cd ~/compass_DCs
+compass --data-mtx expression.mtx genes.tsv sample_names.tsv \
+        --num-processes 32 \
+        --species homo_sapiens
+
+```
+
+
+## 3. Analysis (local RStudio)
+- Compass result analysis is available on https://compass-wagnerlab.readthedocs.io/en/latest/ 
+- Here we generate a heatmap and rank the pathway enrichment result combining Compass result (reactions.tsv) and GSEA
+```{r}
+library(fgsea)
+library(pheatmap)
+library(viridisLite)
+library(tidyr)
+
+# ---- subset names to compare ----
+subsets_to_use <- c("cDC1", "cDC2", "pDC")
+
+
+# ---- Load Compass output ----
+# Compass outputs "penalties" per reaction: lower penalty = more consistent
+# (more feasible) flux through that reaction given the expression data.
+reactions <- read.table("DCs/reactions.tsv", sep = "\t", header = TRUE,
+                        row.names = 1, check.names = FALSE)
+
+# Standard Compass transform: flip penalties into "consistency" scores so that
+# HIGHER values = more metabolically active/consistent reaction (easier to interpret and matches the convention used in Compass tutorials/papers).
+react_mat <- -log(as.matrix(reactions) + 1)
+
+
+# ---- Load metadata, filter to subsets of interest ----
+pbulk_meta <- read.table("DCs/pbulk_metadata.tsv", sep = "\t", header = TRUE,
+                         stringsAsFactors = FALSE)
+meta_use <- pbulk_meta[pbulk_meta$myeloid_celltype %in% subsets_to_use, ]
+
+# Keep only pseudobulk samples that exist in BOTH the reaction matrix and
+# the filtered metadata (keeps the two objects aligned to the same samples)
+react_use <- react_mat[, colnames(react_mat) %in% meta_use$pbulk_id]
+meta_use <- meta_use[meta_use$pbulk_id %in% colnames(react_use), ]
+
+print(table(meta_use$myeloid_celltype))
+# cDC1 cDC2  pDC 
+# 42   45   33
+
+
+# ---- Load Recon2 metadata and filter reactions ----
+reaction_metadata <- read.csv("extdata/RECON2/reaction_metadata.csv", row.names = 1)
+
+# Compass reaction IDs have a "_pos"/"_neg" suffix (forward/reverse direction
+# of a reversible reaction) that isn't in the Recon2 metadata table, so strip
+# it to look up each reaction's annotation.
+base_ids <- sub("_(pos|neg)$", "", rownames(react_use))
+ms <- reaction_metadata[base_ids, ]
+
+# CHECK: if any base_ids aren't found in reaction_metadata, R silently
+# returns an all-NA row instead of erroring, and those reactions get quietly
+# dropped by the `keep` filter below. Worth confirming this is 0 (or small and expected) 
+n_unmatched <- sum(!base_ids %in% rownames(reaction_metadata))
+print(n_unmatched) 
+# 0
+
+# Keep only reactions with:
+#  - confidence 0 (no confidence penalty applied) or 4 (highest confidence)
+#  - a known EC number (i.e. an actual annotated enzyme, not a generic/artificial reaction)
+keep <- ms$confidence %in% c(0, 4) & !is.na(ms$EC_number)
+
+# Citric acid cycle reactions that are NOT in the mitochondrial compartment
+# ([m]) are usually cytosolic/duplicated versions of the same reaction --
+# recode these to "Other" so the "Citric acid cycle" pathway set only contains the true mitochondrial TCA reactions.
+not_mito_tca <- !grepl("\\[m\\]", ms$formula) & ms$subsystem == "Citric acid cycle"
+ms$subsystem[not_mito_tca] <- "Other"
+
+react_use <- react_use[keep, ]
+ms <- ms[keep, ]
+
+
+# ---- Build subsystem -> reaction list (gene sets for GSEA) ----
+reaction_subsys <- setNames(ms$subsystem, rownames(react_use))
+pathways <- split(names(reaction_subsys), reaction_subsys)
+
+# Drop subsystems that aren't real metabolic pathways (transport steps,
+# unassigned/misc buckets, exchange reactions) -- these aren't meaningful
+# units for pathway enrichment.
+exclude <- c("Transport, extracellular", "Transport, mitochondrial",
+             "Transport, peroxisomal", "Transport, lysosomal",
+             "Transport, golgi apparatus", "Transport, endoplasmic reticular",
+             "Transport, nuclear", "Unassigned", "Miscellaneous",
+             "Exchange/demand reaction", "Other")
+pathways <- pathways[!names(pathways) %in% exclude]
+
+# Keep pathway sizes GSEA can reasonably test (too small = unstable, too large = uninformative/non-specific)
+pathways <- pathways[lengths(pathways) >= 5 & lengths(pathways) <= 500]
+
+
+# ---- Drop zero-variance reactions before ranking ----
+# Reactions with identical (e.g. all-zero) consistency scores across every
+# sample in both groups carry no information and produce a Cohen's d of
+# exactly 0 or NA. Leaving them in creates a large block of tied ranks,
+# which is likely the cause of the "ties in preranked stats" warning fgsea
+# threw (40%+ tied). Removing them doesn't change the biology, just makes
+# the ranking cleaner and the tie warning go away.
+zero_var <- apply(react_use, 1, function(r) sd(r, na.rm = TRUE) == 0)
+cat("Zero-variance reactions removed:", sum(zero_var), "of", length(zero_var), "\n")
+react_use <- react_use[!zero_var, ]
+ms <- ms[!zero_var, ]
+
+
+# ---- Cohen's d effect size: compared subsets  ----
+cohens_d <- function(x, y) {
+  # na.rm = TRUE added: without it, a single NA in x or y makes var() return
+  # NA, which silently makes the whole Cohen's d NA for that reaction (and it
+  # then gets dropped later at `ranks[is.finite(ranks)]` with no warning).
+  x <- x[!is.na(x)]
+  y <- y[!is.na(y)]
+  if (length(x) < 2 || length(y) < 2) return(NA)
+  if (sd(c(x, y)) == 0) return(NA)
+  pooled <- sqrt(((length(x) - 1) * var(x) + (length(y) - 1) * var(y)) /
+                   (length(x) + length(y) - 2))
+  (mean(x) - mean(y)) / pooled
+}
+
+# CHECK: confirm whether missingness is actually present in the data.
+# if it's not 0, it explains why some reactions were disappearing from ranking.
+cat("Total NAs in react_use:", sum(is.na(react_use)), "\n")
+# Total NAs in react_use: 0 
+
+
+# ---- For each subset: compared subsets Cohen's d -> GSEA ----
+results <- list()
+for (subset in subsets_to_use) {
+  in_ids  <- meta_use$pbulk_id[meta_use$myeloid_celltype == subset]
+  out_ids <- meta_use$pbulk_id[meta_use$myeloid_celltype != subset]
+  cat("Subset:", subset, "| in:", length(in_ids), "out:", length(out_ids), "\n")
+  if (length(in_ids) < 3 || length(out_ids) < 3) next
+  
+  # Effect size per reaction: positive = higher consistency in this subset than in the rest, negative = lower
+  ranks <- vapply(seq_len(nrow(react_use)), function(i) {
+    cohens_d(react_use[i, in_ids], react_use[i, out_ids])
+  }, numeric(1))
+  names(ranks) <- rownames(react_use)
+  ranks <- ranks[is.finite(ranks)]
+  
+  
+  set.seed(2026)
+  res <- fgsea(pathways = pathways, stats = ranks,
+               minSize = 5, maxSize = 500, scoreType = "pos")
+  res$subset <- subset
+  results[[length(results) + 1]] <- res
+}
+all_res <- do.call(rbind, results)
+# -- output --
+# Subset: cDC1 | in: 42 out: 78 
+# Subset: cDC2 | in: 45 out: 75 
+# Subset: pDC | in: 33 out: 87 
+# Warning messages:
+#  1: In preparePathwaysAndStats(pathways, stats, minSize, maxSize, gseaParam,  :
+#   There are ties in the preranked stats (42.72% of the list).
+#   The order of those tied genes will be arbitrary, which may produce unexpected results.
+#  2: In preparePathwaysAndStats(pathways, stats, minSize, maxSize, gseaParam,  :
+#   There are ties in the preranked stats (42.65% of the list).
+#   The order of those tied genes will be arbitrary, which may produce unexpected results.
+#  3: In preparePathwaysAndStats(pathways, stats, minSize, maxSize, gseaParam,  :
+#   There are ties in the preranked stats (42.72% of the list).
+#   The order of those tied genes will be arbitrary, which may produce unexpected results.
+
+
+# ---- Build heatmap: pathways x subsets ----
+# Cap -log10(padj) at 4 so a handful of extremely significant pathways don't wash out the color scale for everything else
+all_res$score <- pmin(-log10(all_res$padj), 4)
+all_res$score[!is.finite(all_res$score)] <- 0
+
+heat_mat <- as.data.frame(
+  pivot_wider(all_res[, c("pathway", "subset", "score")],
+              names_from = subset, values_from = score)
+)
+rownames(heat_mat) <- heat_mat$pathway
+heat_mat$pathway <- NULL
+heat_mat <- heat_mat[, subsets_to_use]
+heat_mat[is.na(heat_mat)] <- 0
+
+# Keep pathways with a strong signal in at least one subset (score >= 2,
+# i.e. padj <= 0.01) AND that aren't significant across every subset
+# (score >= 1, i.e. padj <= 0.1) -- this filters for pathways that are both
+# strongly and somewhat SPECIFICALLY enriched, rather than generically active everywhere
+strong  <- rowSums(heat_mat >= 2) > 0
+not_all <- rowSums(heat_mat >= 1) <= length(subsets_to_use) - 1
+heat_mat_filt <- heat_mat[strong & not_all, ]
+cat("Pathways shown:", nrow(heat_mat_filt), "\n")
+
+
+# ---- Plot ----
+pheatmap(
+  as.matrix(heat_mat_filt),
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  color = viridis(100),
+  border_color = "black",
+  fontsize_row = 10,
+  fontsize_col = 11,
+  main = "Metabolic pathway enrichment per DC cluster",
+  filename = "260811_DCs_metabolic_pathway_heatmap.png",
+  width = 8, height = 8
+)
+
+```
